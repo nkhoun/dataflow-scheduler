@@ -61,4 +61,46 @@ def KTIRLegalityCheckPass : Pass<"ktir-legality-check", "mlir::ModuleOp"> {
   ];
 }
 
+def IndirectComputeGroupSplitPass
+    : Pass<"indirect-compute-group-split", "mlir::ModuleOp"> {
+  let summary = "Split extracted compute groups containing indirect access tiles";
+  let description = [{
+    For each extracted child module whose function body contains a
+    `ktdp.construct_indirect_access_tile` op, this pass splits that module
+    into two sibling child modules:
+
+    1. An **index-to-address** child module (`local_schedule_idx_to_addr`)
+       that loads the index tensor from the indirect memref, multiplies each
+       entry by the appropriate stride of the base memref to resolve a flat
+       byte-offset address, and stores the resulting address tensor into a
+       freshly allocated `memref<...xindex, global>` addr_buf, which is
+       returned to the orchestrator.
+
+    2. A **gather/scatter** child module (the renamed original) that receives
+       the addr_buf as a function argument, copies it into the IAB (indirect
+       address buffer) memory view, and replaces
+       `ktdp.construct_indirect_access_tile` with
+       `ktdp_lowering.construct_indirect_access_tile` whose indirection is
+       fully resolved through the IAB.  All subscripts into the base memref
+       are direct in the lowered op.
+
+    The orchestrator (top-level inner-module function) is rewritten so that
+    it first calls the index-to-address function to obtain the addr_buf, then
+    passes it to the gather/scatter function.
+
+    The pass is a no-op when no `ktdp.construct_indirect_access_tile` is
+    present in the module.
+  }];
+  let constructor = "::scheduler::createIndirectComputeGroupSplitPass()";
+  let dependentDialects = [
+    "mlir::affine::AffineDialect",
+    "mlir::arith::ArithDialect",
+    "mlir::func::FuncDialect",
+    "mlir::memref::MemRefDialect",
+    "mlir::tensor::TensorDialect",
+    "mlir::ktdp::KtdpDialect",
+    "mlir::ktdp_lowering::KTDPLoweringDialect"
+  ];
+}
+
 #endif // DATAFLOW_SCHEDULER_CONVERSION_KTIRTOSCHEDULEIR_PASSES_TD
