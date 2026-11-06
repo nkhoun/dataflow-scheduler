@@ -60,6 +60,7 @@
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArchIntrinsics.h"
 #include "dataflow-scheduler/Dialect/KTDPLowering/KTDPLowering.h"
 #include "dataflow-scheduler/Dialect/KTDPLowering/KTDPLoweringDialect.h"
+#include "dataflow-scheduler/Utils/ProgramModules.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 #include "ktir/Dialect/KTDP/KTDPAttrs.h"
 #include "ktir/Dialect/KTDP/KTDPTypes.h"
@@ -412,20 +413,6 @@ struct SplitCandidate {
 //===----------------------------------------------------------------------===//
 // Analysis
 //===----------------------------------------------------------------------===//
-
-/// Returns true if @p child is the orchestrator (original-content) module.
-///
-/// After ComputeGroupExtraction the top-level module contains:
-///   - An optional ktdf_arch.device op (not a ModuleOp)
-///   - The orchestrator child module — created without a sym_name
-///   - One or more extracted child modules — named "local_schedule_N"
-///
-/// We distinguish them by the presence of a sym_name: extracted modules always
-/// have one (assigned by SymbolTable::renameToUnique); the orchestrator does
-/// not carry a user-visible symbol.
-static bool isOrchestratorModule(ModuleOp child) {
-  return !child.getSymName().has_value();
-}
 
 /// Collects the indirect access tile of every function defined in every
 /// extracted child module of @p top.  A child module may define more than one

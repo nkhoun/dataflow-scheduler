@@ -33,12 +33,19 @@
 #include "dataflow-scheduler/Dialect/KTDF/Transforms/Passes.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Transforms/Passes.h"
 #include "dataflow-scheduler/Transforms/Passes.h"
+#include "dataflow-scheduler/Utils/ProgramModules.h"
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
 
 using namespace scheduler;
 
 void scheduler::buildKTIRFrontendPipeline(
     mlir::OpPassManager& pm, const SchedulerExtContext& scheduler_ctx) {
+  buildKTIRFrontendPipeline(pm, scheduler_ctx, ReentryMode::Marked);
+}
+
+void scheduler::buildKTIRFrontendPipeline(
+    mlir::OpPassManager& pm, const SchedulerExtContext& scheduler_ctx,
+    ReentryMode reentry_mode) {
   // Checkpoint 'pre_mapping':
   //   - The input is legal KTIR, but not necessarily scheduler-legal.
   //   - The scheduler has not made any mapping / scheduling decisions yet.
@@ -47,7 +54,7 @@ void scheduler::buildKTIRFrontendPipeline(
   pm.addNestedPass<mlir::func::FuncOp>(
       createApplyDevicePatternsPass({"pre_mapping"}));
 
-  pm.addPass(createKTIRLegalityCheckPass());
+  pm.addPass(createKTIRLegalityCheckPass(reentry_mode));
   pm.addPass(createComputeGroupExtractionPass());
   pm.addPass(createIndirectComputeGroupSplitPass());
   pm.addPass(createIndirectAddrBufLegalizationPass());
@@ -67,6 +74,14 @@ void scheduler::buildKTIRFrontendPipeline(
 
 void scheduler::buildSchedulerOptimizationPipeline(
     mlir::OpPassManager& pm, const SchedulerExtContext& scheduler_ctx) {
+  buildSchedulerOptimizationPipeline(pm, scheduler_ctx, ReentryMode::Marked);
+}
+
+// No pass of this stage reads the re-entry mode. It is taken so that every
+// stage is built the same way.
+void scheduler::buildSchedulerOptimizationPipeline(
+    mlir::OpPassManager& pm, const SchedulerExtContext& scheduler_ctx,
+    ReentryMode /*reentry_mode*/) {
   // Checkpoint 'pre_scheduling':
   //   - The input is 'ktdf' with nested modules (!), but not necessarily
   //     platform-legal.
@@ -155,6 +170,12 @@ void scheduler::buildSchedulerOptimizationPipeline(
 
 void scheduler::buildDFIRBackendPipeline(
     mlir::OpPassManager& pm, const SchedulerExtContext& scheduler_ctx) {
+  buildDFIRBackendPipeline(pm, scheduler_ctx, ReentryMode::Marked);
+}
+
+void scheduler::buildDFIRBackendPipeline(
+    mlir::OpPassManager& pm, const SchedulerExtContext& scheduler_ctx,
+    ReentryMode reentry_mode) {
   pm.addPass(mlir::ktdf::createLoopIVAffineMulStrengthReductionPass());
   pm.addPass(createKTDFToKTDFLoweringPass(scheduler_ctx));
 
@@ -166,15 +187,24 @@ void scheduler::buildDFIRBackendPipeline(
   pm.nest<mlir::ModuleOp>().addNestedPass<mlir::func::FuncOp>(
       createApplyDevicePatternsPass({"post_lowering"}));
 
-  pm.addPass(createKTDFLowToDFIRPass());
+  pm.addPass(createKTDFLowToDFIRPass(reentry_mode));
   // And each program given the two levels it is read at: what it is, and the
   // DataflowIR it is compiled from, which takes no arguments.
   pm.addPass(createWrapProgramDFIRPass());
+  // Last, so that a program module is marked only once the run has gone all
+  // the way through it. A later run reads the marker to leave it alone.
+  pm.addPass(createMarkScheduledProgramsPass());
 }
 
 void scheduler::buildKTDPToDFIRPipeline(
     mlir::OpPassManager& pm, const SchedulerExtContext& scheduler_ctx) {
-  buildKTIRFrontendPipeline(pm, scheduler_ctx);
-  buildSchedulerOptimizationPipeline(pm, scheduler_ctx);
-  buildDFIRBackendPipeline(pm, scheduler_ctx);
+  buildKTDPToDFIRPipeline(pm, scheduler_ctx, ReentryMode::Marked);
+}
+
+void scheduler::buildKTDPToDFIRPipeline(
+    mlir::OpPassManager& pm, const SchedulerExtContext& scheduler_ctx,
+    ReentryMode reentry_mode) {
+  buildKTIRFrontendPipeline(pm, scheduler_ctx, reentry_mode);
+  buildSchedulerOptimizationPipeline(pm, scheduler_ctx, reentry_mode);
+  buildDFIRBackendPipeline(pm, scheduler_ctx, reentry_mode);
 }

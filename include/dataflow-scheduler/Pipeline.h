@@ -32,6 +32,12 @@ class OpPassManager;
 namespace scheduler {
 
 struct SchedulerExtContext;
+enum class ReentryMode;
+
+/// Every builder takes the re-entry mode the run is in, which says how a run on
+/// a module that already holds scheduled programs tells them from the new
+/// ones. A caller passes the same mode to every stage of a run. Without one,
+/// the mode is ReentryMode::Marked.
 
 /// Builds the KTIR frontend stage: checks the incoming KTIR is legal and
 /// converts it into an initial Schedule IR (KTDF) pipeline.
@@ -40,6 +46,10 @@ struct SchedulerExtContext;
 void buildKTIRFrontendPipeline(
     mlir::OpPassManager& pm,
     const scheduler::SchedulerExtContext& scheduler_ctx);
+void buildKTIRFrontendPipeline(
+    mlir::OpPassManager& pm,
+    const scheduler::SchedulerExtContext& scheduler_ctx,
+    scheduler::ReentryMode reentry_mode);
 
 /// Builds the scheduler optimization stage: legalizes and refines the Schedule
 /// IR in place — routing data movement, tiling, coarsening, double buffering,
@@ -51,16 +61,25 @@ void buildKTIRFrontendPipeline(
 void buildSchedulerOptimizationPipeline(
     mlir::OpPassManager& pm,
     const scheduler::SchedulerExtContext& scheduler_ctx);
+void buildSchedulerOptimizationPipeline(
+    mlir::OpPassManager& pm,
+    const scheduler::SchedulerExtContext& scheduler_ctx,
+    scheduler::ReentryMode reentry_mode);
 
 /// Builds the DFIR backend stage: lowers the optimized Schedule IR through
 /// KTDFLow into Dataflow IR (DFIR).
 ///
-/// Passes come from `Conversion/backend/ScheduleIRToDFIR`. Note that this does
+/// Passes come from `Conversion/backend/ScheduleIRToDFIR`. Its last pass marks
+/// each program module the run scheduled. Note that this does
 /// not emit the DFIR output; callers that want the resulting DFIR written out
 /// should append `createSplitDFIROutputPass()` themselves.
 void buildDFIRBackendPipeline(
     mlir::OpPassManager& pm,
     const scheduler::SchedulerExtContext& scheduler_ctx);
+void buildDFIRBackendPipeline(
+    mlir::OpPassManager& pm,
+    const scheduler::SchedulerExtContext& scheduler_ctx,
+    scheduler::ReentryMode reentry_mode);
 
 /// Builds the full KTDP to DFIR pipeline with the given pass manager, by
 /// chaining the KTIR frontend, scheduler optimization and DFIR backend stages.
@@ -70,6 +89,10 @@ void buildDFIRBackendPipeline(
 void buildKTDPToDFIRPipeline(
     mlir::OpPassManager& pm,
     const scheduler::SchedulerExtContext& scheduler_ctx);
+void buildKTDPToDFIRPipeline(
+    mlir::OpPassManager& pm,
+    const scheduler::SchedulerExtContext& scheduler_ctx,
+    scheduler::ReentryMode reentry_mode);
 
 }  // namespace scheduler
 

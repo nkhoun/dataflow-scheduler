@@ -20,7 +20,7 @@
 // CHECK-NEXT:   func.func(
 // CHECK-NEXT:   apply-device-patterns{groups={pre_mapping}}
 // CHECK-NEXT:   )
-// CHECK-NEXT:   ktir-legality-check
+// CHECK-NEXT:   ktir-legality-check{reentry-mode=marked}
 // CHECK-NEXT:   compute-group-extraction
 // CHECK-NEXT:   indirect-compute-group-split
 // CHECK-NEXT:   indirect-addr-buf-legalization
@@ -94,8 +94,9 @@
 // CHECK-NEXT:   apply-device-patterns{groups={post_lowering}}
 // CHECK-NEXT:   )
 // CHECK-NEXT:   )
-// CHECK-NEXT:   ktdflowering-to-dfir
+// CHECK-NEXT:   ktdflowering-to-dfir{reentry-mode=marked}
 // CHECK-NEXT:   wrap-program-dfir
+// CHECK-NEXT:   mark-scheduled-programs
 // CHECK-NEXT:   emit-split-dfir
 
 // expected-error @below {{no 'ktdf_arch.device' is present in the module and no device file name is provided to ensure-device-declaration pass}}

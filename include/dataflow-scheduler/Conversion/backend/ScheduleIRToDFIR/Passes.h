@@ -27,6 +27,8 @@
 
 #include <memory>
 
+#include "dataflow-scheduler/Utils/ProgramModules.h"
+
 namespace mlir {
 class Pass;
 class OpPassManager;
@@ -48,7 +50,11 @@ std::unique_ptr<mlir::Pass> createKTDFLowToDFIRPass();
 std::unique_ptr<mlir::Pass> createKTDFLowToDFIRPass(
     const scheduler::SchedulerExtContext& scheduler_ctx);
 
+std::unique_ptr<mlir::Pass> createKTDFLowToDFIRPass(ReentryMode mode);
+
 std::unique_ptr<mlir::Pass> createWrapProgramDFIRPass();
+
+std::unique_ptr<mlir::Pass> createMarkScheduledProgramsPass();
 
 std::unique_ptr<mlir::Pass> createSplitDFIROutputPass();
 std::unique_ptr<mlir::Pass> createSplitDFIROutputPass(

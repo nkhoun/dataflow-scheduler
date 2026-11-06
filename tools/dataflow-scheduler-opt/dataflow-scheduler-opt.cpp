@@ -34,10 +34,28 @@
 #include "dataflow-scheduler/Pipeline.h"
 #include "dataflow-scheduler/RegisterEverything.h"
 #include "dataflow-scheduler/Transforms/Passes.h"
+#include "dataflow-scheduler/Utils/ProgramModules.h"
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
 #include "ktir/Dialect/SpyreOp/SpyreOpDialect.h"
 
 using namespace mlir;
+
+namespace {
+
+/// The options the registered scheduler pipelines take.
+struct SchedulerPipelineOptions
+    : public mlir::PassPipelineOptions<SchedulerPipelineOptions> {
+  Option<scheduler::ReentryMode> reentryMode{
+      *this, "reentry-mode",
+      llvm::cl::desc("How a re-run tells a program module it has already "
+                     "scheduled from a new one"),
+      llvm::cl::init(scheduler::ReentryMode::Marked),
+      llvm::cl::values(clEnumValN(scheduler::ReentryMode::Marked, "marked",
+                                  "By the dataflow_scheduler.scheduled "
+                                  "marker"))};
+};
+
+}  // namespace
 
 void registerPassPipelinesForScheduler() {
   static llvm::cl::opt<std::string> splitDFIROutputDir(
@@ -50,21 +68,25 @@ void registerPassPipelinesForScheduler() {
       "device", llvm::cl::desc("Device architecture filename"),
       llvm::cl::value_desc("filename"), llvm::cl::init(""));
 
-  mlir::PassPipelineRegistration<>(
+  mlir::PassPipelineRegistration<SchedulerPipelineOptions>(
       "ktir-to-dfir", "Schedule and lower KTIR to DataflowIR",
-      [&](mlir::OpPassManager& pm) {
+      [&](mlir::OpPassManager& pm, const SchedulerPipelineOptions& options) {
         scheduler::buildKTDPToDFIRPipeline(
-            pm, scheduler::SchedulerExtContext::dummyContext());
+            pm, scheduler::SchedulerExtContext::dummyContext(),
+            options.reentryMode);
       });
 
-  mlir::PassPipelineRegistration<>(
-      "kEmitDFIR", "Emit DataflowIR", [&](mlir::OpPassManager& pm) {
+  mlir::PassPipelineRegistration<SchedulerPipelineOptions>(
+      "kEmitDFIR", "Emit DataflowIR",
+      [&](mlir::OpPassManager& pm,
+          const SchedulerPipelineOptions& pipeline_options) {
         scheduler::EnsureDeviceDeclarationPassOptions options;
         options.deviceFileName = schedulerDeviceFilename.getValue();
         pm.addPass(scheduler::createEnsureDeviceDeclarationPass(options));
 
         scheduler::buildKTDPToDFIRPipeline(
-            pm, scheduler::SchedulerExtContext::dummyContext());
+            pm, scheduler::SchedulerExtContext::dummyContext(),
+            pipeline_options.reentryMode);
         pm.addPass(scheduler::createSplitDFIROutputPass(splitDFIROutputDir));
       });
 }

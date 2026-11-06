@@ -164,16 +164,38 @@ struct DerivedKey {
   }
 };
 
+/// Hands out the run's symbol ids and says which symbol each program argument
+/// is.
+///
+/// Every id is declared in the IR by a `symbol.create_id`, and a consumer reads
+/// what an id means from those declarations. It never works one out from a
+/// signature: an input's id is not its position, and a module the pipeline has
+/// run on before holds ids from earlier runs, which new ones are numbered
+/// below.
 class SymbolAllocator {
  public:
-  /// Numbers the inputs of every kernel under \p top and declares each on the
-  /// argument it arrives as, so that what an id means is said in the IR.
-  /// Derived ids start after the last input's.
+  /// What a program argument is to the run.
+  enum class ArgumentKind {
+    /// It is, or is passed, a value a `symbol.create_id` declares.
+    Symbol,
+    /// It is passed a constant nothing declares: a plain constant.
+    Constant,
+    /// Neither: a value computed, or a loop's induction variable, passed in
+    /// without a declaration. No symbol stands for it.
+    Undeclared,
+  };
+
+  /// Builds the allocator for \p top: scans it for the ids already in use,
+  /// then numbers below them the inputs of every kernel under \p top that no
+  /// `symbol.create_id` declares yet, and declares each on the argument it
+  /// arrives as. Derived ids are handed out below the last input's.
   ///
   /// A kernel is a function nothing under \p top calls. Its index-typed
   /// arguments are the run's inputs; an argument of any other type is not
   /// something a symbol can stand for and is passed over.
-  explicit SymbolAllocator(mlir::ModuleOp top);
+  ///
+  /// Fails, reporting it, where one value is declared as two different ids.
+  static mlir::FailureOr<SymbolAllocator> build(mlir::ModuleOp top);
 
   /// Declares on \p func's own arguments the input each one arrives as.
   ///
@@ -190,12 +212,22 @@ class SymbolAllocator {
   /// Returns the symbol id standing for \p address if it is a run input,
   /// std::nullopt if it is not.
   ///
-  /// An input is a block argument of a function's entry block, traced back
-  /// through the calls that pass it along until the kernel is reached. Its
-  /// position in the *kernel's* signature is what identifies it: a program
-  /// function takes only the inputs it reads, so two programs' first arguments
-  /// are in general two different tensors.
+  /// An input is a block argument of a function's entry block that is, or is
+  /// passed, a declared value. The trace follows the calls that pass the
+  /// argument along: at each, it stops at a value a `symbol.create_id`
+  /// declares, whatever that value is, and takes its id; otherwise it goes on
+  /// while the value passed is an argument of the caller. A kernel's arguments
+  /// are all declared, so a chain that reaches one ends at a declaration.
   std::optional<int64_t> inputSymbolIdFor(mlir::Value address) const;
+
+  /// What \p arg, an argument of a function's entry block, is to the run.
+  ArgumentKind classifyArgument(mlir::BlockArgument arg) const;
+
+  /// Fails, reporting it on the argument, for every index-typed argument of
+  /// \p func that is ArgumentKind::Undeclared: a computed value passed into a
+  /// program without a `symbol.create_id`, which would otherwise reach code
+  /// generation as a bare argument with no symbol to correct it by.
+  mlir::LogicalResult verifyArgumentsDeclared(mlir::func::FuncOp func) const;
 
   /// Returns the id for the symbol \p key describes, and whether that id is
   /// newly handed out.
@@ -206,12 +238,11 @@ class SymbolAllocator {
   /// there are units, all meaning the same thing and each resolved separately.
   std::pair<int64_t, bool> derivedIdFor(const DerivedKey& key);
 
-  /// How many inputs the run takes, i.e. how many ids are the inputs' own.
-  int64_t numInputs() const { return -next_input_ - 1; }
-
  private:
-  /// One past the last input id handed out, so `-(count + 1)`.
-  int64_t next_input_ = -1;
+  SymbolAllocator() = default;
+
+  /// The next id to hand out, below every id in use. Inputs take ids first,
+  /// then derived addresses.
   int64_t next_derived_ = -1;
   /// The id handed out for each derived address, keyed by the three things that
   /// identify one: the input it is rooted at, the offset added to it, and the

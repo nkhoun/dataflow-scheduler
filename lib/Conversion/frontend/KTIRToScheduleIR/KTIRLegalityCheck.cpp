@@ -22,8 +22,10 @@
 
 #include "dataflow-scheduler/Conversion/frontend/KTIRToScheduleIR/Passes.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDFDialect.h"
+#include "dataflow-scheduler/Utils/ProgramModules.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 #include "ktir/Dialect/SpyreOp/SpyreOpDialect.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/DebugLog.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -81,98 +83,145 @@ namespace {
   return false;
 }
 
+/// Checks every op in \p root against the rules, reporting the first that
+/// breaks one. Returns whether one did.
+[[nodiscard]] auto violatesRules(mlir::Operation* root) -> bool {
+  bool failed = false;
+
+  root->walk<mlir::WalkOrder::PreOrder>(
+      [&](mlir::Operation* op) -> mlir::WalkResult {
+        // Rule 1: loop-carried control flow.
+        if (auto forOp = mlir::dyn_cast<mlir::scf::ForOp>(op)) {
+          if (forOp.getNumRegionIterArgs() > 0) {
+            forOp.emitError(
+                "V1 does not support scf.for with loop-carried arguments "
+                "(iter_args)");
+            failed = true;
+            return mlir::WalkResult::interrupt();
+          }
+          return mlir::WalkResult::advance();
+        }
+        if (auto whileOp = mlir::dyn_cast<mlir::scf::WhileOp>(op)) {
+          whileOp.emitError("V1 does not support scf.while loops");
+          failed = true;
+          return mlir::WalkResult::interrupt();
+        }
+
+        // Rule 3 & 4: unsupported ktdp construct ops.
+        if (mlir::isa<mlir::ktdp::ConstructDistributedMemoryViewOp>(op)) {
+          op->emitError(
+              "V1 does not support ktdp.construct_distributed_memory_view");
+          failed = true;
+          return mlir::WalkResult::interrupt();
+        }
+        // Rule 2: compute ops.
+        // 2a: named linalg ops (anything in the linalg dialect that is not a
+        // generic/yield). Allow add/mul/sub/reduce; reject other named ops.
+        if (op->getDialect() ==
+            op->getContext()->getLoadedDialect<mlir::linalg::LinalgDialect>()) {
+          if (mlir::isa<mlir::linalg::GenericOp>(op)) {
+            // Inspect the generic body: every op must be a legal body op.
+            mlir::WalkResult bodyResult = op->getRegion(0).walk(
+                [&](mlir::Operation* inner) -> mlir::WalkResult {
+                  if (!isLegalGenericBodyOp(inner)) {
+                    inner->emitError(
+                        "V1 only supports add/mul/sub compute ops; found "
+                        "unsupported compute op");
+                    return mlir::WalkResult::interrupt();
+                  }
+                  return mlir::WalkResult::advance();
+                });
+            if (bodyResult.wasInterrupted()) {
+              failed = true;
+              return mlir::WalkResult::interrupt();
+            }
+            // skip descending again into the body (already inspected)
+            return mlir::WalkResult::skip();
+          }
+          if (mlir::isa<mlir::linalg::AddOp, mlir::linalg::MulOp,
+                        mlir::linalg::SubOp, mlir::linalg::MaxOp,
+                        mlir::linalg::MinOp, mlir::linalg::YieldOp>(op)) {
+            return mlir::WalkResult::advance();
+          }
+          if (mlir::isa<mlir::linalg::ReduceOp>(op)) {
+            // Inspect the reduce body: every op must be a legal body op.
+            mlir::WalkResult bodyResult = op->getRegion(0).walk(
+                [&](mlir::Operation* inner) -> mlir::WalkResult {
+                  if (!isLegalGenericBodyOp(inner)) {
+                    inner->emitError(
+                        "V1 only supports add/mul/sub compute ops; found "
+                        "unsupported compute op");
+                    return mlir::WalkResult::interrupt();
+                  }
+                  return mlir::WalkResult::advance();
+                });
+            if (bodyResult.wasInterrupted()) {
+              failed = true;
+              return mlir::WalkResult::interrupt();
+            }
+            return mlir::WalkResult::skip();
+          }
+          // Any other named linalg op is unsupported.
+          op->emitError(
+              "V1 only supports add/mul/sub/reduce compute ops; found "
+              "unsupported compute op");
+          failed = true;
+          return mlir::WalkResult::interrupt();
+        }
+
+        return mlir::WalkResult::advance();
+      });
+
+  return failed;
+}
+
 struct KTIRLegalityCheckPass
     : public impl::KTIRLegalityCheckPassBase<KTIRLegalityCheckPass> {
+  using KTIRLegalityCheckPassBase::KTIRLegalityCheckPassBase;
+
   void runOnOperation() final {
     if (DisableThisPass) return;
     LDBG(1) << "========= " PASS_NAME " =========";
     mlir::ModuleOp module = getOperation();
+
+    // With no declaration module this is a first run, and the input is KTIR
+    // throughout, so all of it is checked.
+    const bool has_declaration_module =
+        llvm::any_of(module.getOps<mlir::ModuleOp>(), isOrchestratorModule);
+    if (!has_declaration_module) {
+      if (violatesRules(module)) signalPassFailure();
+      return;
+    }
+
+    // Otherwise only what the run is to schedule. The declaration module holds
+    // calls the scheduler generated or the caller wrote, and a program module
+    // an earlier run scheduled holds whatever that run left, loops with
+    // iter_args included.
     bool failed = false;
-
-    module.walk<mlir::WalkOrder::PreOrder>([&](mlir::Operation* op)
-                                               -> mlir::WalkResult {
-      // Rule 1: loop-carried control flow.
-      if (auto forOp = mlir::dyn_cast<mlir::scf::ForOp>(op)) {
-        if (forOp.getNumRegionIterArgs() > 0) {
-          forOp.emitError(
-              "V1 does not support scf.for with loop-carried arguments "
-              "(iter_args)");
-          failed = true;
-          return mlir::WalkResult::interrupt();
-        }
-        return mlir::WalkResult::advance();
+    for (mlir::Operation& op : module.getBody()->getOperations()) {
+      auto child = mlir::dyn_cast<mlir::ModuleOp>(op);
+      if (!child) {
+        failed |= violatesRules(&op);
+        continue;
       }
-      if (auto whileOp = mlir::dyn_cast<mlir::scf::WhileOp>(op)) {
-        whileOp.emitError("V1 does not support scf.while loops");
+      mlir::FailureOr<ModuleKind> kind = classifyModule(child, reentryMode);
+      if (mlir::failed(kind)) {
         failed = true;
-        return mlir::WalkResult::interrupt();
+        continue;
       }
-
-      // Rule 3 & 4: unsupported ktdp construct ops.
-      if (mlir::isa<mlir::ktdp::ConstructDistributedMemoryViewOp>(op)) {
-        op->emitError(
-            "V1 does not support ktdp.construct_distributed_memory_view");
-        failed = true;
-        return mlir::WalkResult::interrupt();
+      switch (*kind) {
+        case ModuleKind::Declaration:
+          LDBG(1) << "  the declaration module is not checked";
+          break;
+        case ModuleKind::Scheduled:
+          LDBG(1) << "  @" << child.getSymName().value_or("")
+                  << " is already scheduled; not checked";
+          break;
+        case ModuleKind::New:
+          failed |= violatesRules(child);
+          break;
       }
-      // Rule 2: compute ops.
-      // 2a: named linalg ops (anything in the linalg dialect that is not a
-      // generic/yield). Allow add/mul/sub/reduce; reject other named ops.
-      if (op->getDialect() ==
-          op->getContext()->getLoadedDialect<mlir::linalg::LinalgDialect>()) {
-        if (mlir::isa<mlir::linalg::GenericOp>(op)) {
-          // Inspect the generic body: every op must be a legal body op.
-          mlir::WalkResult bodyResult = op->getRegion(0).walk(
-              [&](mlir::Operation* inner) -> mlir::WalkResult {
-                if (!isLegalGenericBodyOp(inner)) {
-                  inner->emitError(
-                      "V1 only supports add/mul/sub compute ops; found "
-                      "unsupported compute op");
-                  return mlir::WalkResult::interrupt();
-                }
-                return mlir::WalkResult::advance();
-              });
-          if (bodyResult.wasInterrupted()) {
-            failed = true;
-            return mlir::WalkResult::interrupt();
-          }
-          // skip descending again into the body (already inspected)
-          return mlir::WalkResult::skip();
-        }
-        if (mlir::isa<mlir::linalg::AddOp, mlir::linalg::MulOp,
-                      mlir::linalg::SubOp, mlir::linalg::MaxOp,
-                      mlir::linalg::MinOp, mlir::linalg::YieldOp>(op)) {
-          return mlir::WalkResult::advance();
-        }
-        if (mlir::isa<mlir::linalg::ReduceOp>(op)) {
-          // Inspect the reduce body: every op must be a legal body op.
-          mlir::WalkResult bodyResult = op->getRegion(0).walk(
-              [&](mlir::Operation* inner) -> mlir::WalkResult {
-                if (!isLegalGenericBodyOp(inner)) {
-                  inner->emitError(
-                      "V1 only supports add/mul/sub compute ops; found "
-                      "unsupported compute op");
-                  return mlir::WalkResult::interrupt();
-                }
-                return mlir::WalkResult::advance();
-              });
-          if (bodyResult.wasInterrupted()) {
-            failed = true;
-            return mlir::WalkResult::interrupt();
-          }
-          return mlir::WalkResult::skip();
-        }
-        // Any other named linalg op is unsupported.
-        op->emitError(
-            "V1 only supports add/mul/sub/reduce compute ops; found "
-            "unsupported compute op");
-        failed = true;
-        return mlir::WalkResult::interrupt();
-      }
-
-      return mlir::WalkResult::advance();
-    });
-
+    }
     if (failed) signalPassFailure();
   }
 };
@@ -181,6 +230,13 @@ struct KTIRLegalityCheckPass
 
 std::unique_ptr<mlir::Pass> scheduler::createKTIRLegalityCheckPass() {
   return std::make_unique<KTIRLegalityCheckPass>();
+}
+
+std::unique_ptr<mlir::Pass> scheduler::createKTIRLegalityCheckPass(
+    ReentryMode mode) {
+  KTIRLegalityCheckPassOptions options;
+  options.reentryMode = mode;
+  return std::make_unique<KTIRLegalityCheckPass>(options);
 }
 
 // Made with Bob

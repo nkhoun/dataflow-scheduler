@@ -41,6 +41,7 @@
 #include "dataflow-scheduler/Dialect/KTDFLowering/KTDFLowering.h"
 #include "dataflow-scheduler/Dialect/Symbol/Symbol.h"
 #include "dataflow-scheduler/Dialect/Uniform/Uniform.h"
+#include "dataflow-scheduler/Utils/ProgramModules.h"
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
 #include "ktir/Dialect/KTDP/KTDPDialect.h"
 #include "llvm/Support/DebugLog.h"
@@ -84,6 +85,9 @@ struct KTDFLowToDFIRPass
     : public impl::KTDFLowToDFIRPassBase<KTDFLowToDFIRPass> {
   KTDFLowToDFIRPass(const SchedulerExtContext& scheduler_ctx)
       : scheduler_ctx_(scheduler_ctx) {}
+  KTDFLowToDFIRPass(const SchedulerExtContext& scheduler_ctx,
+                    const KTDFLowToDFIRPassOptions& options)
+      : KTDFLowToDFIRPassBase(options), scheduler_ctx_(scheduler_ctx) {}
 
   void runOnOperation() override {
     LDBG(1) << "========= " PASS_NAME " =========";
@@ -108,16 +112,25 @@ struct KTDFLowToDFIRPass
     auto& memory_tree =
         default_device.getRef().getOrCreateView<arch_view::MemoryTree>();
 
-    // The run's symbols, numbered once for the whole module: nothing sets a
-    // range of ids aside, so two functions cannot each start from the top. This
-    // also declares in the IR which symbol each of the run's inputs is, which
-    // is what lets a consumer read the numbering rather than work it out again.
-    SymbolAllocator symbols(module_op);
+    // The run's symbols, numbered once for the whole module, below every id
+    // already in it: nothing sets a range of ids aside, so two functions, or
+    // two runs, cannot each start from the top. This also declares in the IR
+    // which symbol each of the run's inputs is, which is what lets a consumer
+    // read the numbering rather than work it out again.
+    mlir::FailureOr<SymbolAllocator> built = SymbolAllocator::build(module_op);
+    if (mlir::failed(built)) return signalPassFailure();
+    SymbolAllocator& symbols = *built;
 
     llvm::SmallVector<mlir::func::FuncOp, 4> funcs;
     module_op.walk([&](mlir::func::FuncOp func) { funcs.push_back(func); });
     for (auto func : funcs) {
+      if (skip(func)) continue;
       LDBG(1) << "Running " << PASS_NAME << " on " << func.getName();
+
+      // A program passed a computed value nobody declared would reach code
+      // generation reading a bare argument, with no symbol to correct it by.
+      if (mlir::failed(symbols.verifyArgumentsDeclared(func)))
+        return signalPassFailure();
 
       auto split = partitionPreludeAndWork(func);
       if (split.work_ops.empty()) {
@@ -172,6 +185,29 @@ struct KTDFLowToDFIRPass
   }
 
  private:
+  /// Whether \p func is in a program module an earlier run scheduled, and is
+  /// left as it is.
+  ///
+  /// The declaration module is not skipped: it holds calls and loops, which no
+  /// stage lowers, so the pass leaves it as it is anyway, apart from the
+  /// symbols the allocator declares there. Nor could it be found by shape here:
+  /// a test of this pass alone may hold its programs in unnamed modules too.
+  bool skip(mlir::func::FuncOp func) const {
+    mlir::ModuleOp child = getTopLevelChildModule(func);
+    if (!child) return false;
+    switch (reentryMode) {
+      case ReentryMode::Marked:
+        if (isScheduled(child)) {
+          LDBG(1) << "@" << func.getName() << " is in @"
+                  << child.getSymName().value_or("")
+                  << ", which is already scheduled; leaving it unaltered";
+          return true;
+        }
+        return false;
+    }
+    llvm_unreachable("unknown re-entry mode");
+  }
+
   const SchedulerExtContext& schedulerExtContext() const {
     return scheduler_ctx_;
   }
@@ -189,4 +225,12 @@ std::unique_ptr<mlir::Pass> scheduler::createKTDFLowToDFIRPass(
 std::unique_ptr<mlir::Pass> scheduler::createKTDFLowToDFIRPass() {
   return std::make_unique<KTDFLowToDFIRPass>(
       SchedulerExtContext::dummyContext());
+}
+
+std::unique_ptr<mlir::Pass> scheduler::createKTDFLowToDFIRPass(
+    ReentryMode mode) {
+  KTDFLowToDFIRPassOptions options;
+  options.reentryMode = mode;
+  return std::make_unique<KTDFLowToDFIRPass>(
+      SchedulerExtContext::dummyContext(), options);
 }

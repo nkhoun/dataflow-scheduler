@@ -27,6 +27,8 @@
 
 #include <memory>
 
+#include "dataflow-scheduler/Utils/ProgramModules.h"
+
 namespace mlir {
 class Pass;
 class OpPassManager;
@@ -39,6 +41,7 @@ struct SchedulerExtContext;
 namespace scheduler {
 
 std::unique_ptr<mlir::Pass> createKTIRLegalityCheckPass();
+std::unique_ptr<mlir::Pass> createKTIRLegalityCheckPass(ReentryMode mode);
 std::unique_ptr<mlir::Pass> createComputeGroupExtractionPass();
 std::unique_ptr<mlir::Pass> createIndirectComputeGroupSplitPass();
 std::unique_ptr<mlir::Pass> createConstructThreeStagePipelinePass(

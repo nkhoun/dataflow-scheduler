@@ -40,8 +40,23 @@ def KTIRLegalityCheckPass : Pass<"ktir-legality-check", "mlir::ModuleOp"> {
     constructs: scf.for with loop-carried args, scf.while, compute ops outside
     {add, mul, sub}, or the ktdp distributed-memory-view / indirect-access-tile
     ops. Mutates nothing; legal input passes through.
+
+    On a module that already holds a declaration module, the rules apply only
+    to the program modules still to be scheduled. Which those are is decided
+    by the re-entry mode: in marked mode, the program modules without the
+    dataflow_scheduler.scheduled marker. A marked module that still holds a
+    ktdp transfer op, and an unmarked one that holds none, are errors.
   }];
   let constructor = "::scheduler::createKTIRLegalityCheckPass()";
+  let options = [
+    Option<"reentryMode", "reentry-mode", "::scheduler::ReentryMode",
+           /*default=*/"::scheduler::ReentryMode::Marked",
+           "How a re-run tells a program module it has already scheduled from a "
+           "new one",
+           [{::llvm::cl::values(
+             clEnumValN(::scheduler::ReentryMode::Marked, "marked",
+                        "By the dataflow_scheduler.scheduled marker"))}]>
+  ];
   let dependentDialects = [
     "mlir::scf::SCFDialect",
     "mlir::linalg::LinalgDialect"

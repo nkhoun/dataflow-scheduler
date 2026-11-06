@@ -66,8 +66,21 @@ def KTDFLowToDFIRPass : Pass<"ktdflowering-to-dfir", "mlir::ModuleOp"> {
     dataflow.program_unit per type containing a self-contained clone of the
     work region with ktdf_lowering.execute_on ops unwrapped or dropped per
     type-applicability and ktdf_lowering.signal ops filtered similarly.
+
+    The declaration module, which calls the programs, is skipped. So is every
+    program module an earlier run scheduled: in marked mode, every module with
+    the dataflow_scheduler.scheduled marker.
   }];
   let constructor = "::scheduler::createKTDFLowToDFIRPass()";
+  let options = [
+    Option<"reentryMode", "reentry-mode", "::scheduler::ReentryMode",
+           /*default=*/"::scheduler::ReentryMode::Marked",
+           "How a re-run tells a program module it has already scheduled from a "
+           "new one",
+           [{::llvm::cl::values(
+             clEnumValN(::scheduler::ReentryMode::Marked, "marked",
+                        "By the dataflow_scheduler.scheduled marker"))}]>
+  ];
   let dependentDialects = [
     "mlir::agen::AgenDialect",
     "mlir::dataflow::DataflowDialect",
@@ -100,6 +113,20 @@ def WrapProgramDFIRPass : Pass<"wrap-program-dfir", "mlir::ModuleOp"> {
     "mlir::func::FuncDialect",
     "mlir::symbol::SymbolDialect"
   ];
+}
+
+def MarkScheduledProgramsPass : Pass<"mark-scheduled-programs", "mlir::ModuleOp"> {
+  let summary = "Mark each program module the run scheduled";
+  let description = [{
+    Sets the dataflow_scheduler.scheduled unit attribute on every child module
+    of the top-level module that holds DataflowIR and is not marked yet. The
+    declaration module, the one child module without a name, is never marked.
+
+    The last pass of the pipeline, so that the marker says a module went through
+    the whole of it. A later run on the same module leaves a marked module as it
+    is.
+  }];
+  let constructor = "::scheduler::createMarkScheduledProgramsPass()";
 }
 
 def SplitDFIROutputPass : Pass<"emit-split-dfir", "mlir::ModuleOp"> {

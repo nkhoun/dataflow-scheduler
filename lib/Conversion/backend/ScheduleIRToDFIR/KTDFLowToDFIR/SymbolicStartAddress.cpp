@@ -18,6 +18,7 @@
 
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/SymbolicStartAddress.h"
 
+#include <algorithm>
 #include <limits>
 
 #include "dataflow-scheduler/Dialect/Symbol/Symbol.h"
@@ -199,7 +200,47 @@ std::optional<int64_t> evaluateAtUnit(mlir::Value value, mlir::Value unit) {
 // SymbolAllocator
 //===----------------------------------------------------------------------===//
 
-SymbolAllocator::SymbolAllocator(mlir::ModuleOp top) {
+/// The id \p value is declared as, or std::nullopt if no `symbol.create_id`
+/// takes it. A value declared as two ids has already been reported when the
+/// allocator was built, so the first is as good as any.
+static std::optional<int64_t> declaredIdOf(mlir::Value value) {
+  for (mlir::Operation* user : value.getUsers())
+    if (auto declaration = mlir::dyn_cast<mlir::symbol::CreateIdOp>(user))
+      return declaration.getSymbolId();
+  return std::nullopt;
+}
+
+mlir::FailureOr<SymbolAllocator> SymbolAllocator::build(mlir::ModuleOp top) {
+  SymbolAllocator allocator;
+
+  // The ids already in use, wherever they are: a module the pipeline has run
+  // on before holds the ids that run handed out, and those a caller declared.
+  // Only the Symbol dialect's ops are read; an id a caller keeps on an op of
+  // its own is also declared by a symbol.create_id, which is what is found.
+  int64_t lowest = 0;
+  llvm::DenseMap<mlir::Value, mlir::symbol::CreateIdOp> declared;
+  bool conflicting = false;
+  top.walk([&](mlir::Operation* op) {
+    if (auto declaration = mlir::dyn_cast<mlir::symbol::CreateIdOp>(op)) {
+      lowest = std::min(lowest, declaration.getSymbolId());
+      auto [it, inserted] =
+          declared.try_emplace(declaration.getInput(), declaration);
+      if (!inserted && it->second.getSymbolId() != declaration.getSymbolId()) {
+        declaration.emitError()
+            << "value is declared as symbol " << declaration.getSymbolId()
+            << " and as symbol " << it->second.getSymbolId()
+            << "; one value cannot stand for two symbols";
+        conflicting = true;
+      }
+    } else if (auto symbol = mlir::dyn_cast<mlir::symbol::CreateSymbolOp>(op)) {
+      lowest = std::min(lowest, symbol.getSymbolID());
+    }
+  });
+  if (conflicting) return mlir::failure();
+  int64_t next = lowest - 1;
+  LDBG(1) << "  lowest symbol id in use is " << lowest << "; numbering from "
+          << next;
+
   // The kernels: the functions with bodies that nothing calls. Their arguments
   // are what the run takes in.
   llvm::SmallVector<mlir::func::FuncOp> kernels;
@@ -215,27 +256,23 @@ SymbolAllocator::SymbolAllocator(mlir::ModuleOp top) {
     builder.setInsertionPointToStart(&kernel.getBody().front());
     for (mlir::BlockArgument arg : kernel.getArguments()) {
       // An argument of any other type is not an address and no symbol stands
-      // for it. Numbering still counts the position, so that what an id is
-      // follows from the signature rather than from which arguments happened to
-      // be addresses.
-      if (mlir::isa<mlir::IndexType>(arg.getType())) {
-        mlir::symbol::CreateIdOp::create(builder, arg.getLoc(), arg,
-                                         next_input_);
-        LDBG(1) << "  " << kernel.getName() << " argument "
-                << arg.getArgNumber() << " is symbol " << next_input_;
-      }
+      // for it.
+      if (!mlir::isa<mlir::IndexType>(arg.getType())) continue;
+      // Declared already, by an earlier run or by the caller: it keeps its id.
+      if (declared.contains(arg)) continue;
       // Ids only ever descend, and a negative id is what marks one as a symbol,
       // so a wrap would hand out a positive number that means something else.
-      // It takes 2^63 arguments to get here, but an id that is silently not a
-      // symbol is not a failure anything downstream would catch.
-      if (next_input_ == std::numeric_limits<int64_t>::min())
+      if (next == std::numeric_limits<int64_t>::min())
         llvm::report_fatal_error(
-            "symbol ids exhausted numbering the run's "
-            "inputs");
-      --next_input_;
+            "symbol ids exhausted numbering the run's inputs");
+      mlir::symbol::CreateIdOp::create(builder, arg.getLoc(), arg, next);
+      LDBG(1) << "  " << kernel.getName() << " argument " << arg.getArgNumber()
+              << " is symbol " << next;
+      --next;
     }
   }
-  next_derived_ = next_input_;
+  allocator.next_derived_ = next;
+  return allocator;
 }
 
 std::pair<int64_t, bool> SymbolAllocator::derivedIdFor(const DerivedKey& key) {
@@ -266,19 +303,27 @@ std::optional<int64_t> SymbolAllocator::inputSymbolIdFor(
 
   mlir::ModuleOp top = topLevelModuleOf(arg.getOwner()->getParentOp());
 
-  // Walk up the calls that pass this argument along. The loop ends at the
-  // top-level function -- the kernel, whose signature is the run's own inputs.
+  // Walk up the calls that pass this argument along, until a declared value is
+  // reached. A kernel's index arguments are all declared, so the walk ends at
+  // the kernel at the latest.
   for (unsigned depth = 0; depth <= kMaxCallDepth; ++depth) {
+    if (std::optional<int64_t> id = declaredIdOf(arg)) return id;
+
     auto func = mlir::cast<mlir::func::FuncOp>(arg.getOwner()->getParentOp());
     mlir::func::CallOp call = soleCallTo(top, func);
-    if (!call) {
-      if (!mlir::isa<mlir::IndexType>(arg.getType())) return std::nullopt;
-      return -static_cast<int64_t>(arg.getArgNumber()) - 1;
-    }
+    // An undeclared argument of a function nothing calls is not an input: the
+    // allocator declares every index argument of a kernel. A call that does not
+    // match the signature passes nothing the argument can be traced to.
+    if (!call || call.getNumOperands() != func.getNumArguments())
+      return std::nullopt;
 
     mlir::Value arg_passed = call.getOperand(arg.getArgNumber());
+    // The value at the call site is what the caller says it is, whatever it
+    // is: a value computed there, or a constant, is a symbol if declared.
+    if (std::optional<int64_t> id = declaredIdOf(arg_passed)) return id;
     mlir::BlockArgument outer = asFunctionArgument(arg_passed);
-    // A constant, or something the caller computed: arg_passed is not an input.
+    // A constant, or something the caller computed without declaring it:
+    // arg_passed is not an input.
     if (!outer) return std::nullopt;
     arg = outer;
   }
@@ -286,6 +331,44 @@ std::optional<int64_t> SymbolAllocator::inputSymbolIdFor(
   LDBG(1) << "  gave up tracing an address through " << kMaxCallDepth
           << " calls";
   return std::nullopt;
+}
+
+SymbolAllocator::ArgumentKind SymbolAllocator::classifyArgument(
+    mlir::BlockArgument arg) const {
+  if (inputSymbolIdFor(arg)) return ArgumentKind::Symbol;
+
+  mlir::ModuleOp top = topLevelModuleOf(arg.getOwner()->getParentOp());
+  for (unsigned depth = 0; depth <= kMaxCallDepth; ++depth) {
+    auto func = mlir::cast<mlir::func::FuncOp>(arg.getOwner()->getParentOp());
+    mlir::func::CallOp call = soleCallTo(top, func);
+    // Not called once, or called with operands that do not match: there is no
+    // single value it is passed to say anything about. Left as it is today.
+    if (!call || call.getNumOperands() != func.getNumArguments())
+      return ArgumentKind::Constant;
+    mlir::Value arg_passed = call.getOperand(arg.getArgNumber());
+    if (mlir::getConstantIntValue(arg_passed)) return ArgumentKind::Constant;
+    mlir::BlockArgument outer = asFunctionArgument(arg_passed);
+    if (!outer) return ArgumentKind::Undeclared;
+    arg = outer;
+  }
+  return ArgumentKind::Constant;
+}
+
+mlir::LogicalResult SymbolAllocator::verifyArgumentsDeclared(
+    mlir::func::FuncOp func) const {
+  if (func.getBody().empty()) return mlir::success();
+  bool failed = false;
+  for (mlir::BlockArgument arg : func.getArguments()) {
+    if (!mlir::isa<mlir::IndexType>(arg.getType())) continue;
+    if (classifyArgument(arg) != ArgumentKind::Undeclared) continue;
+    func.emitError() << "argument " << arg.getArgNumber() << " of @"
+                     << func.getName()
+                     << " is passed a value that is neither a constant nor "
+                        "declared by a symbol.create_id; declare the value at "
+                        "the call so that a symbol stands for it";
+    failed = true;
+  }
+  return mlir::failure(failed);
 }
 
 //===----------------------------------------------------------------------===//

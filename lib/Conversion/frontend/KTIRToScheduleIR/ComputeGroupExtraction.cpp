@@ -75,12 +75,30 @@
 /// - Handles iter args (block arguments) by passing them as function parameters
 /// - Recursively materializes dependencies (constants, memory views, etc.)
 /// - Creates nested module structure with forward declarations
+///
+/// Re-runs:
+/// --------
+/// A top-level module that already holds a declaration module -- an unnamed
+/// child module -- has been through this pass before: the pipeline is being run
+/// again on it. The pass then extracts nothing, because it cannot work out
+/// where a new call belongs in an existing declaration module. The caller
+/// writes a new kernel in the form this pass would have produced instead:
+/// a named program module whose name the declaration module calls. The pass
+/// checks that form:
+///
+/// - a named child module the declaration module calls is already extracted,
+///   whether it is new or an earlier run scheduled it, and is left as it is;
+/// - a named child module the declaration module does not call is an error: a
+///   program with no call site;
+/// - a function at the top level, outside any module, is an error: there is no
+///   defined place for its call.
 //
 //===----------------------------------------------------------------------===//
 
 #include "dataflow-scheduler/Conversion/frontend/KTIRToScheduleIR/Passes.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArch.h"
+#include "dataflow-scheduler/Utils/ProgramModules.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 #include "llvm/ADT/EquivalenceClasses.h"
 #include "llvm/Support/DebugLog.h"
@@ -130,6 +148,12 @@ struct ComputeGroupExtractionPass
   };
 
   void runOn(mlir::ModuleOp module_op);
+
+  /// Checks the extracted form a re-run finds, with \p declarations the
+  /// declaration module already in \p module_op. Fails, reporting it, on a
+  /// program module nothing calls or a function outside any module.
+  mlir::LogicalResult validateExtractedForm(mlir::ModuleOp module_op,
+                                            mlir::ModuleOp declarations);
 
   /// Walks the ancestor tree of a StoreOp's data operand and unions access
   /// tiles from any LoadOps found with the StoreOp's access tile.
@@ -662,10 +686,62 @@ void ComputeGroupExtractionPass::runOn(mlir::ModuleOp module_op) {
   (void)mlir::runRegionDCE(rewriter, module_op->getRegions());
 }
 
+mlir::LogicalResult ComputeGroupExtractionPass::validateExtractedForm(
+    mlir::ModuleOp module_op, mlir::ModuleOp declarations) {
+  // The names the declaration module calls, wherever the call is: at the top of
+  // a kernel or inside one of its loops.
+  llvm::DenseSet<mlir::StringAttr> called;
+  declarations.walk([&](mlir::func::CallOp call) {
+    called.insert(call.getCalleeAttr().getAttr());
+  });
+
+  bool failed = false;
+  for (mlir::Operation& op : module_op.getBody()->getOperations()) {
+    if (auto func = mlir::dyn_cast<mlir::func::FuncOp>(op)) {
+      func.emitError()
+          << "function outside any module alongside a declaration module; "
+             "write it as a program module the declaration module calls";
+      failed = true;
+      continue;
+    }
+    auto child = mlir::dyn_cast<mlir::ModuleOp>(op);
+    if (!child || child == declarations) continue;
+    if (isOrchestratorModule(child)) {
+      child.emitError() << "more than one declaration module (unnamed child "
+                           "module) at the top level";
+      failed = true;
+      continue;
+    }
+    // Keyed on the module's own name: a scheduled program also holds a
+    // function nothing calls, the DataflowIR it is compiled from.
+    if (!called.contains(child.getSymNameAttr())) {
+      child.emitError() << "program module @" << *child.getSymName()
+                        << " is not called by the declaration module";
+      failed = true;
+      continue;
+    }
+    LDBG(1) << "  @" << *child.getSymName()
+            << " is already extracted; leaving it unaltered";
+  }
+  return mlir::failure(failed);
+}
+
 void ComputeGroupExtractionPass::runOnOperation() {
   if (DisableThisPass) return;
   LDBG(1) << "========= " PASS_NAME " =========";
   mlir::ModuleOp module_op = getOperation();
+
+  // A declaration module already there means the pipeline has run on this
+  // module before. Its programs are extracted already, and a new kernel is
+  // written in extracted form by the caller.
+  for (auto child : module_op.getOps<mlir::ModuleOp>()) {
+    if (!isOrchestratorModule(child)) continue;
+    LDBG(1) << "  reusing the declaration module already present";
+    if (mlir::failed(validateExtractedForm(module_op, child)))
+      signalPassFailure();
+    return;
+  }
+
   runOn(module_op);
 }
 
